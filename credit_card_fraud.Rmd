@@ -1,0 +1,487 @@
+---
+title: "bank_fraud"
+author: "Group Project"
+date: "2023-11-09"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=6, fig.height=5)
+```
+
+## 1. Introducton
+This project aims to identify fraudulent transactions with Credit Cards. Our objective is to build a Fraud detection system using Machine learning techniques. Each transaction is labelled either fraudulent or not fraudulent. 
+Note that prevalence of fraudulent transactions is very low in the dataset, hence the dataset will be balanced using re-sampling techniques.
+
+
+## 2. Data Understanding
+
+The dataset contain 555719 transactions with 23 attributes that will be analyzed and then used to build a machine model for making predictions.
+
+Dataset Breakdown: 23 attributes (22 predictive attributes and  1 goal field)
+```{r}
+#importing library
+
+suppressMessages({
+library(caret)
+library(tidyverse)
+library(randomForest)
+library(corrplot)
+library(rpart)
+library(kernlab)
+library(pROC)
+library(ROSE) #library for resampling
+library(lubridate)
+library(class)})
+```
+
+```{r}
+#Load dataset
+fraud_csv <- read.csv("fraud_dataset.csv")
+head(fraud_csv)
+```
+```{r}
+#checking initial structure and datatypes in dataset
+str(fraud_csv)
+```
+```{r}
+#checking for cardinality of columns and also for null values
+fraud_csv %>% summarise_all(n_distinct)
+sum(is.na.data.frame(fraud_csv))
+```
+
+### Converting features to appropriate datatypes
+```{r}
+#convert time to posix
+fraud_csv$datetime <- as.POSIXct(fraud_csv$trans_date_trans_time, format="%Y-%m-%d %H:%M:%S")
+
+#extract dates
+fraud_csv$date <- as.Date(fraud_csv$datetime)
+#extract age from dob
+fraud_csv$dob <- as.Date(fraud_csv$dob)
+fraud_csv$age_2022 <- round(as.numeric(difftime(as.Date("2022-01-01"), fraud_csv$dob, units = "days")) / 365.25, 0)
+
+#convert dates +times into day, month and hour
+fraud_csv$time <- format(fraud_csv$datetime, format="%H:%M:%S")
+fraud_csv$hour <- as.numeric(hour(fraud_csv$datetime))
+fraud_csv$weekday <- weekdays(as.Date(fraud_csv$datetime))
+fraud_csv$weekday2 <-  as.numeric(format(fraud_csv$datetime, format = "%u"))
+fraud_csv$month<- as.numeric(month(fraud_csv$datetime))
+
+#convert gender to int
+fraud_csv$gender <- ifelse(fraud_csv$gender=="M", 1, 0)
+
+#concatenation of name 
+fraud_csv$full_name <- paste(fraud_csv$first, fraud_csv$last, sep = " ")
+```
+
+```{r}
+#checking new structure of dataset with new features created
+str(fraud_csv)
+```
+```{r}
+write.csv(fraud_csv, file = "fraud_csv_new.csv")
+```
+
+```{r}
+#counting number of occurences of fraud(1) and no_fraud(0)
+table(fraud_csv$is_fraud)
+prop.table(table(fraud_csv$is_fraud))
+```
+```{r}
+# visualizing data imbalance
+ggplot(fraud_csv, aes(x = is_fraud)) +
+geom_bar() +
+geom_text(stat='count', aes(label=..count..), vjust=-1)
+```
+Extrapolating cost of Fraud (incidents and monetary value)  for the whole year
+```{r}
+#days_in_dataset: 194
+
+days_in_dataset <- 194
+
+# Calculate expected number of fraud cases per year
+fraud_per_day <- sum(fraud_csv$is_fraud) / days_in_dataset
+fraud_per_year <- fraud_per_day * 365
+fraud_per_year_rounded <- round(fraud_per_year, 0)
+fraud_per_year_rounded
+
+# Calculate average non-fraudulent amount per day
+nf_amount_df <- subset(fraud_csv, is_fraud == 0)
+nf_amount_per_day <- sum(nf_amount_df$amt) / days_in_dataset
+nf_amount_per_day_rounded <- round(nf_amount_per_day, 2)
+paste(nf_amount_per_day_rounded, "$")
+
+# Calculate average fraudulent amount per day
+fraud_amount_df <- subset(fraud_csv, is_fraud == 1)
+fraud_amount_per_day <- sum(fraud_amount_df$amt) / days_in_dataset
+fraud_amount_per_day_rounded <- round(fraud_amount_per_day, 2)
+paste(fraud_amount_per_day_rounded, "$")
+
+# Estimate total fraudulent amount per year
+total_fraud_yearly <- round(fraud_amount_per_day * 365, 2)
+paste(total_fraud_yearly, "$")
+
+# Estimate total non-fraudulent amount per year
+total_non_fraud_yearly <- round(nf_amount_per_day * 365, 2)
+paste(total_non_fraud_yearly, "$")
+```
+## 3. Exploratory Data Analysis
+
+Before running machine learning models, features will be explored to see if there is any trends to point to prevelance of fraudulent transactions.
+
+```{r}
+#sub-setting dataset for just fraudulent transactions
+fraud_txns <- fraud_csv[fraud_csv$is_fraud == 1,]
+dim(fraud_txns)
+```
+
+```{r}
+#checking distribution of fraudulent transaction amount
+df_filtered <- fraud_txns[fraud_txns$amt < quantile(fraud_txns$amt, 0.99),] 
+hist(df_filtered$amt, breaks=100, main='Histogram of Fraud Transaction Amounts', xlab='Amount')
+```
+
+```{r}
+fraud_by_age <- fraud_txns %>%
+  group_by(age_2022) %>%
+  summarise(count_fraud = n())
+
+ggplot(fraud_by_age, aes(age_2022, count_fraud, width =0.6)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Fraud by Age", x = "Card Holder Age", y = "Fraud Count") +
+scale_x_continuous(n.breaks=20)
+```
+
+```{r}
+fraud_by_hour <- fraud_txns %>%
+  group_by(hour) %>%
+  summarise(count_fraud = n())
+
+#visualizing fraud distribution by hour
+ggplot(fraud_by_hour, aes(hour, count_fraud)) +
+  geom_line() +
+  labs(title = "Fraud Transactions by the Hour",
+       x = "Hour",
+       y = "Number of Fraud Transactions")
+```
+There is a clear trend of fraudulent transactions in the first 3 hours of the day and also last 2 hours. 
+
+```{r}
+fraud_by_category <- fraud_txns %>%
+  group_by(category) %>%
+  summarise(count_fraud = n())
+
+
+ggplot(data= fraud_by_category, aes(x=category, y= count_fraud))+ 
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+Higher fraud rates in grocery_pos and shopping_net transactions 
+
+```{r}
+fraud_by_weekday <- fraud_txns %>%
+  group_by(weekday) %>%
+  summarise(count_fraud = n())
+
+
+ggplot(data= fraud_by_weekday, aes(x=weekday, y= count_fraud,fill=weekday))+ 
+  geom_bar(stat="identity") 
+```
+
+```{r}
+boxplot(amt ~ is_fraud, data = fraud_csv, 
+        main = "Fraud Status by Transaction Amount", 
+        xlab = "Fraud Status", 
+        ylab = "Transaction Amount", 
+        names = c("No Fraud", "Fraud"))
+```
+
+## 4 Balancing Dataset and Feature Selection
+### 4.1 Balancing Dataset
+```{r}
+#setting the no of fraud as non_fraud cases as well as desired percentage of fraud in new dataset
+r0 <- 0.40
+n0 <- nrow(fraud_csv)
+```
+
+```{r}
+sampling_result <- ovun.sample(is_fraud ~ ., data = fraud_csv, method = "both", N = n0,
+                               p = r0, seed = 2018)
+```
+
+```{r}
+balanced_data <- sampling_result$data
+table(balanced_data$is_fraud)
+prop.table(table(balanced_data$is_fraud))
+```
+```{r}
+ggplot(balanced_data, aes(x = is_fraud)) +
+geom_bar() +
+geom_text(stat='count', aes(label=..count..), vjust=-1)
+```
+### 4.3 Feature Selection
+Feature Set 1 - All variables that do not contain relevant information and also modified variables will be dropped.
+
+```{r}
+# Remove using subset
+balanced_data2 <- subset(balanced_data, select = -c(X, trans_date_trans_time, cc_num,merchant, first, last,
+                                                   street, city,dob,trans_num,unix_time, datetime, date,
+                                                   time,  weekday))
+```
+
+```{r}
+str(balanced_data2)
+```
+Feature Set 2 Dropping more variables that will likely not contribute to prediction
+```{r}
+balanced_data3 <- subset(balanced_data2, select = -c(job, state, full_name ))
+```
+
+```{r}
+str(balanced_data3)
+```
+
+```{r}
+#Checking for multicollinearity among variables using correlation matrix
+
+cor_matrix <- cor(balanced_data3[, sapply(balanced_data3, is.numeric)])
+
+corrplot(cor_matrix, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.srt = 45, 
+         # Add grid and color
+         addgrid.col = "black", col = colorRampPalette(c("#6D9EC1", "white", "#E46726"))(200))
+
+```
+
+```{r}
+#encoding categorical variables
+dmy <- dummyVars(" ~ .", data = balanced_data3, fullRank = T)
+balanced_data4 <- data.frame(predict(dmy, newdata = balanced_data3))
+
+#convert numerical data that are categories to factors
+balanced_data4$gender <- factor(balanced_data4$gender)
+balanced_data4$month <- factor(balanced_data4$month)
+balanced_data4$weekday2 <- factor(balanced_data4$weekday2)
+
+
+str(balanced_data4)
+```
+## 5 Machine Leearning Modelling
+4 Models will be used to evaluate this classification task. They are:
+i: Logistic Regression
+ii: Decision Tree
+iii: KNN
+iv: Random Forests
+
+The models will be compared using classification ML metrics then the best one selected.
+
+First the dataset will be split into Training and Test set
+
+```{r}
+#To achieve reproducible model; set the random seed number
+set.seed(100)
+
+# Data is split into training and test set in a 80:20 ratio
+TrainingIndex <- createDataPartition(balanced_data4$is_fraud, p=0.75, list = FALSE)
+
+TrainingSet <- balanced_data4[TrainingIndex,]# Training Set
+TestingSet <- balanced_data4[-TrainingIndex,]# Test Set
+```
+### 5.1 Logistic Regression
+```{r}
+cls <- glm(is_fraud~., family='binomial',data=TrainingSet)
+cut=0.5
+```
+```{r}
+#Calculate the training error
+yhat = (predict(cls,TrainingSet,type="response")>cut)
+tr.err = mean(TrainingSet$is_fraud != yhat) 
+tr.err
+```
+
+```{r}
+#Calculate the testing error
+yhat_test=(predict(cls,TestingSet,type="response")>cut)
+te_err=mean(TestingSet$is_fraud!=yhat_test)
+te_err
+```
+
+```{r}
+# Prediction on TestingSet using Logistic Regression
+cls_prediction <- predict(cls, TestingSet, type ="response")
+head(cls_prediction)
+```
+```{r}
+#Assigning probabilities - If prediction exceeds threshold of 0.5, 1 else 0
+cls_prediction <- ifelse(cls_prediction >0.5,1,0)
+head(cls_prediction)
+```
+
+```{r}
+#Computing confusion matrix values
+confusionMatrix(factor(TestingSet$is_fraud),factor(cls_prediction), mode ='everything', positive ="0")
+```
+## 5.2 Decision Trees
+```{r}
+tree <- rpart(is_fraud ~., method = 'class', data = TrainingSet, control = rpart.control(cp = 0.0001))
+```
+```{r}
+# Predict using the decision tree model on the test data
+predicted_values <- predict(tree, newdata = TestingSet, type = "class")
+
+# Assuming 'is_fraud' is the actual target variable in the test data
+actual_values <- TestingSet$is_fraud
+actual_values <- as.factor(actual_values)
+levels(actual_values) <- c("0", "1")
+```
+
+```{r}
+tree_predictions <-predict(tree, TestingSet, type = 'class')
+head(tree_predictions)
+```
+
+```{r}
+# Create confusion matrix
+conf_matrix <- confusionMatrix(predicted_values, actual_values)
+
+print(conf_matrix)
+```
+### 5.3 KNN
+```{r}
+fraudtrain <-TrainingSet$is_fraud
+
+#k selection with sqrt of total obs
+print(sqrt(nrow(fraudtrain)/2))
+
+```
+
+```{r}
+k <- 455
+
+knnmodel <- knn(train = TrainingSet, test = TestingSet, cl = fraudtrain, k = k)
+
+accuracy <- 100 * sum(TestingSet$is_fraud == knnmodel) / nrow(TestingSet)
+cat("k =", k, "Accuracy =", accuracy, "\n")
+
+# Get predicted labels from the KNN model
+predicted_labels <- as.numeric(knnmodel)
+
+# Calculate confusion matrix
+conf_matrix <- table(Actual = TestingSet$is_fraud, Predicted = predicted_labels)
+
+# Calculate True Positives (TP), False Positives (FP), True Negatives (TN), False Negatives (FN)
+TP <- conf_matrix[2, 2]
+FP <- conf_matrix[1, 2]
+TN <- conf_matrix[1, 1]
+FN <- conf_matrix[2, 1]
+
+# Calculate True Positive Rate (TPR) and False Positive Rate (FPR)
+TPR <- TP / (TP + FN)
+TNR <- TN / (TN+FP)
+FPR <- FP / (FP + TN)
+
+
+TPR
+TNR
+FPR
+
+```
+### 5.4 Random Forest
+```{r}
+#First step in running rf is converting target variable to factor
+TrainingSet$is_fraud <- as.factor(TrainingSet$is_fraud)
+
+# converting TestingSet$popular to factor
+is_fraud_factor <-  as.factor(TestingSet$is_fraud)
+```
+
+```{r}
+# Assuming your data frame is called 'df' and the target variable is 'target'
+rf_model <- randomForest(is_fraud~ ., data = TrainingSet, ntree = 100)
+rf_model
+```
+```{r}
+rf_predictions <- predict(rf_model, TestingSet)
+head(rf_predictions)
+```
+```{r}
+cf_rf <- confusionMatrix(rf_predictions, is_fraud_factor)
+cf_rf
+```
+```{r}
+#error rate for rf_model
+rf_error_rate <- 1 - cf_rf$overall["Accuracy"]
+rf_error_rate
+```
+Calculating AUC-ROC for the random forest model
+```{r}
+#converting prediction scores data type before plotting curves
+rf_predictions <- as.numeric(rf_predictions)
+
+#creating the ROC function
+rf_roc_curve <- roc(TestingSet$is_fraud, rf_predictions)
+```
+
+```{r}
+rf_score <- print(paste('rf_roc_curve score is', auc(rf_roc_curve)))
+```
+
+Calculating Variable Importance
+```{r}
+importance_values <- importance(rf_model)
+importance_values
+
+```
+
+```{r, fig.width = 9.0 }
+varImpPlot(rf_model)
+```
+## 6 Model Evaluation
+Models are  evaluated using accuracy from confusion matrix, testing error and also AUC score.
+
+###6.1 Plotting ROC Curves
+```{r}
+#converting prediction scores data type before plotting curves
+cls_prediction <- as.numeric(cls_prediction)
+tree_curve <- as.numeric(tree_predictions)
+rf_predictions <- as.numeric(rf_predictions)
+```
+
+```{r}
+#creating the ROC function
+cls_roc_curve <- roc(TestingSet$is_fraud, cls_prediction)
+tree_roc_curve <- roc(TestingSet$is_fraud, tree_curve)
+rf_roc_curve <- roc(TestingSet$is_fraud, rf_predictions)
+
+```
+
+```{r}
+# Plotting ROC Curves
+plot(cls_roc_curve, col = "blue", print.auc = TRUE)
+plot(tree_roc_curve, col = "red", add = TRUE)
+plot(rf_roc_curve, col = "yellow", add = TRUE)
+
+```
+
+```{r}
+#calculating AUC curves of models# Calculate ROC and AUC using pROC
+cls_score <- print(paste('cls roc_roc_curve score is',auc(cls_roc_curve)))
+tree_score <- print(paste('tree_roc_curve score is',auc(tree_roc_curve)))
+rf_score <- print(paste('rf_roc_curve score is', auc(rf_roc_curve)))
+```
+### 6.2 Table of Results
+```{r}
+# Create a new table with some sample data
+Model_Comparison <- data.frame(
+  Model = c("Logistic Regression", "Decison Trees", "Random Forest", "KNN"),
+  Accuracy = c(0.861, 0.994, 0.999, 0.896),
+  TestingError = c(0.139, 0.006, 0.001, 0.104),
+  Sensitivity = c(0.843, 0.9908, 0.999, 0.897),
+  Specificity = c(0.897, 1, 1, 0.896))
+
+# Display the new table
+print(Model_Comparison)
+```
